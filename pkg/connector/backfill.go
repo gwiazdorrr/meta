@@ -278,7 +278,11 @@ func (m *MetaClient) FetchMessages(ctx context.Context, params bridgev2.FetchMes
 					zerolog.Ctx(ctx).Warn().Msg("Backfill collector did not call done, but has all messages")
 					break Loop
 				} else if time.Since(start) > timeout {
-					zerolog.Ctx(ctx).Error().Msg("Waiting for backfill collector timed out")
+					zerolog.Ctx(ctx).Error().
+						Dur("timeout", timeout).
+						Int("portal_event_buffer", bridgev2.PortalEventBuffer).
+						Int("collected_messages", len(collector.Messages)).
+						Msg("Waiting for backfill collector timed out")
 					if ErrorOnBackfillTimeout {
 						return nil, fmt.Errorf("failed to backfill history")
 					}

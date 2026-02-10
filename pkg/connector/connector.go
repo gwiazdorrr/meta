@@ -5,6 +5,7 @@ import (
 
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
 
@@ -38,6 +39,15 @@ func (m *MetaConnector) Init(bridge *bridgev2.Bridge) {
 	m.DB = metadb.New(bridge.ID, bridge.DB.Database, m.Bridge.Log.With().Str("db_section", "meta").Logger())
 	m.MsgConv = msgconv.New(bridge, m.DB)
 	m.MsgConv.DisableViewOnce = m.Config.DisableViewOnce
+	if m.Config.PortalEventBuffer > 0 {
+		bridgev2.PortalEventBuffer = m.Config.PortalEventBuffer
+	}
+	if m.Config.EventChannelSize > 0 {
+		appservice.EventChannelSize = m.Config.EventChannelSize
+	}
+	if m.Config.BackfillTimeout > 0 {
+		BackfillTimeout = m.Config.BackfillTimeout
+	}
 }
 
 func (m *MetaConnector) Start(ctx context.Context) error {

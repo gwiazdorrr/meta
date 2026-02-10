@@ -50,6 +50,10 @@ type Config struct {
 	LogRedactedBloksPayloads         bool `yaml:"log_redacted_bloks_payloads"`
 
 	ThreadBackfill ThreadBackfillConfig `yaml:"thread_backfill"`
+
+	PortalEventBuffer int           `yaml:"portal_event_buffer"`
+	EventChannelSize  int           `yaml:"event_channel_size"`
+	BackfillTimeout   time.Duration `yaml:"backfill_timeout"`
 }
 
 type ThreadBackfillConfig struct {
@@ -107,6 +111,9 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "log_redacted_bloks_payloads")
 	helper.Copy(up.Int, "thread_backfill", "batch_count")
 	helper.Copy(up.Str|up.Int, "thread_backfill", "batch_delay")
+	helper.Copy(up.Int, "portal_event_buffer")
+	helper.Copy(up.Int, "event_channel_size")
+	helper.Copy(up.Str|up.Int, "backfill_timeout")
 }
 
 func (m *MetaConnector) GetConfig() (string, any, up.Upgrader) {
