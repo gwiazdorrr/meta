@@ -70,5 +70,6 @@ thread_backfill:
 portal_event_buffer: 0
 # Size of the appservice event channel buffer. If 0, uses the framework default (64).
 event_channel_size: 0
+
 # Timeout for backfill collectors waiting for message history. If 0s, uses the default (30s).
 backfill_timeout: 0s
