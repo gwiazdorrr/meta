@@ -35,7 +35,7 @@ func (m *MetaConnector) Init(bridge *bridgev2.Bridge) {
 		m.Bridge.DB.Dialect.String(),
 		waLog.Zerolog(m.Bridge.Log.With().Str("db_section", "whatsmeow").Logger()),
 	)
-	m.Bridge.Commands.(*commands.Processor).AddHandlers(cmdToggleEncryption, cmdImportMessages)
+	m.Bridge.Commands.(*commands.Processor).AddHandlers(cmdToggleEncryption, cmdExport)
 	m.DB = metadb.New(bridge.ID, bridge.DB.Database, m.Bridge.Log.With().Str("db_section", "meta").Logger())
 	m.MsgConv = msgconv.New(bridge, m.DB)
 	m.MsgConv.DisableViewOnce = m.Config.DisableViewOnce
