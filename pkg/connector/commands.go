@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
@@ -76,10 +78,8 @@ var cmdImportMessages = &commands.FullHandler{
 }
 
 type messengerExport struct {
-	Participants []struct {
-		Name string `json:"name"`
-	} `json:"participants"`
-	Messages []messengerMessage `json:"messages"`
+	Participants []string           `json:"participants"`
+	Messages     []messengerMessage `json:"messages"`
 }
 
 type messengerMessage struct {
@@ -90,18 +90,73 @@ type messengerMessage struct {
 	IsUnsent    bool   `json:"isUnsent"`
 }
 
+func downloadJSON(ce *commands.Event) ([]byte, bool) {
+	if ce.ReplyTo != "" {
+		evt, err := ce.Bot.GetEvent(ce.Ctx, ce.RoomID, ce.ReplyTo)
+		if err != nil {
+			ce.Reply("Failed to get replied-to event: %v", err)
+			return nil, false
+		}
+		content, ok := evt.Content.Parsed.(*event.MessageEventContent)
+		if !ok {
+			ce.Reply("Replied-to event is not a message")
+			return nil, false
+		}
+		url := content.URL
+		var file *event.EncryptedFileInfo
+		if content.File != nil {
+			url = content.File.URL
+			file = content.File
+		}
+		if url == "" {
+			ce.Reply("Replied-to message has no file attachment")
+			return nil, false
+		}
+		data, err := ce.Bot.DownloadMedia(ce.Ctx, url, file)
+		if err != nil {
+			ce.Reply("Failed to download file: %v", err)
+			return nil, false
+		}
+		return data, true
+	}
+
+	// Find mxc:// URL in args (skip --dry-run)
+	for _, arg := range ce.Args {
+		if strings.HasPrefix(arg, "mxc://") {
+			data, err := ce.Bot.DownloadMedia(ce.Ctx, id.ContentURIString(arg), nil)
+			if err != nil {
+				ce.Reply("Failed to download file: %v", err)
+				return nil, false
+			}
+			return data, true
+		}
+	}
+
+	ce.Reply("Usage: upload JSON file to this room, then reply to it with `import-messages`")
+	return nil, false
+}
+
 func fnImportMessages(ce *commands.Event) {
 	if ce.Portal.RoomType != database.RoomTypeDM {
 		ce.Reply("This command only works in DM rooms")
 		return
 	}
-	if ce.RawArgs == "" {
-		ce.Reply("Usage: import-messages <JSON>")
+
+	dryRun := false
+	for _, arg := range ce.Args {
+		if arg == "--dry-run" {
+			dryRun = true
+			break
+		}
+	}
+
+	jsonData, ok := downloadJSON(ce)
+	if !ok {
 		return
 	}
 
-	var export messengerExport
-	if err := json.Unmarshal([]byte(ce.RawArgs), &export); err != nil {
+	export, err := parseMessengerExport(jsonData)
+	if err != nil {
 		ce.Reply("Failed to parse JSON: %v", err)
 		return
 	}
@@ -117,6 +172,26 @@ func fnImportMessages(ce *commands.Event) {
 		return
 	}
 
+	ghostName := ghost.Name
+	toSend := filterAndSortMessages(export.Messages)
+
+	if dryRun {
+		ghostCount := 0
+		userCount := 0
+		for _, msg := range toSend {
+			if msg.SenderName == ghostName {
+				ghostCount++
+			} else {
+				userCount++
+			}
+		}
+		first := time.UnixMilli(toSend[0].Timestamp).Format("2006-01-02 15:04")
+		last := time.UnixMilli(toSend[len(toSend)-1].Timestamp).Format("2006-01-02 15:04")
+		ce.Reply("Dry run: %d messages to import (%d skipped), %d as ghost (%s), %d as you, from %s to %s",
+			len(toSend), len(export.Messages)-len(toSend), ghostCount, ghostName, userCount, first, last)
+		return
+	}
+
 	// Get double puppet intent for sending as the user
 	userIntent := ce.User.DoublePuppet(ce.Ctx)
 	if userIntent == nil {
@@ -124,22 +199,7 @@ func fnImportMessages(ce *commands.Event) {
 		return
 	}
 
-	ghostName := ghost.Name
-
-	// Sort messages by timestamp ascending
-	sort.Slice(export.Messages, func(i, j int) bool {
-		return export.Messages[i].Timestamp < export.Messages[j].Timestamp
-	})
-
-	imported := 0
-	skipped := 0
-	for _, msg := range export.Messages {
-		if msg.Type != "text" || msg.IsUnsent || msg.Text == "" {
-			skipped++
-			continue
-		}
-
-		// Pick the right intent: if sender matches ghost name, use ghost; otherwise use double puppet (the user)
+	for _, msg := range toSend {
 		var intent bridgev2.MatrixAPI
 		if msg.SenderName == ghostName {
 			intent = ghost.Intent
@@ -163,8 +223,28 @@ func fnImportMessages(ce *commands.Event) {
 			ce.Reply("Error sending message (ts=%d): %v", msg.Timestamp, err)
 			return
 		}
-		imported++
 	}
 
-	ce.Reply(fmt.Sprintf("Imported %d messages (%d skipped)", imported, skipped))
+	ce.Reply(fmt.Sprintf("Imported %d messages (%d skipped)", len(toSend), len(export.Messages)-len(toSend)))
+}
+
+func parseMessengerExport(data []byte) (*messengerExport, error) {
+	var export messengerExport
+	if err := json.Unmarshal(data, &export); err != nil {
+		return nil, err
+	}
+	return &export, nil
+}
+
+func filterAndSortMessages(msgs []messengerMessage) []messengerMessage {
+	var out []messengerMessage
+	for _, msg := range msgs {
+		if msg.Type == "text" && !msg.IsUnsent && msg.Text != "" {
+			out = append(out, msg)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Timestamp < out[j].Timestamp
+	})
+	return out
 }
