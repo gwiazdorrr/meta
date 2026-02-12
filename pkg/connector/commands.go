@@ -1,10 +1,9 @@
 package connector
 
 import (
-	"archive/zip"
-	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -90,14 +89,12 @@ type messengerMedia struct {
 	URI string `json:"uri"`
 }
 
-// loadedConversation holds a parsed and filtered conversation ready for import.
 type loadedConversation struct {
 	OtherParticipant string
 	AllMessages      []messengerMessage
 	ToSend           []messengerMessage
 }
 
-// sentEvents tracks event IDs sent per room, for undo.
 type sentEvents struct {
 	RoomID   id.RoomID
 	EventIDs []id.EventID
@@ -105,7 +102,7 @@ type sentEvents struct {
 
 var (
 	loadedConversations   map[string]*loadedConversation // keyed by other participant name (lowercased)
-	loadedMediaFiles      map[string][]byte              // keyed by path (e.g. "media/uuid.jpeg")
+	loadedMsgsDir         string                         // path to the msgs directory on disk
 	lastSentEvents        *sentEvents
 	loadedConversationsMu sync.Mutex
 )
@@ -141,8 +138,6 @@ func filterAndSortMessages(msgs []messengerMessage) []messengerMessage {
 	return out
 }
 
-// otherParticipant returns the participant name that isn't "Piotr Gwiazdowski".
-// For DM exports, there are exactly 2 participants.
 func otherParticipant(participants []string) string {
 	for _, p := range participants {
 		if p != "Piotr Gwiazdowski" {
@@ -152,52 +147,66 @@ func otherParticipant(participants []string) string {
 	return ""
 }
 
-func downloadAttachment(ce *commands.Event) ([]byte, bool) {
-	if ce.ReplyTo == "" {
-		ce.Reply("Reply to a file message with this command")
-		return nil, false
-	}
-	evt, err := ce.Bot.GetEvent(ce.Ctx, ce.RoomID, ce.ReplyTo)
+// loadFromDir reads all JSON files from a directory and returns conversations.
+func loadFromDir(dir string) (map[string]*loadedConversation, []string) {
+	convos := make(map[string]*loadedConversation)
+	var errors []string
+
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		ce.Reply("Failed to get replied-to event: %v", err)
-		return nil, false
+		return nil, []string{fmt.Sprintf("failed to read directory: %v", err)}
 	}
-	content, ok := evt.Content.Parsed.(*event.MessageEventContent)
-	if !ok {
-		ce.Reply("Replied-to event is not a message")
-		return nil, false
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("%s: read error: %v", entry.Name(), err))
+			continue
+		}
+
+		export, err := parseMessengerExport(data)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("%s: parse error: %v", entry.Name(), err))
+			continue
+		}
+
+		other := otherParticipant(export.Participants)
+		if other == "" {
+			errors = append(errors, fmt.Sprintf("%s: can't determine other participant from %v", entry.Name(), export.Participants))
+			continue
+		}
+
+		toSend := filterAndSortMessages(export.Messages)
+		key := strings.ToLower(other)
+		convos[key] = &loadedConversation{
+			OtherParticipant: other,
+			AllMessages:      export.Messages,
+			ToSend:           toSend,
+		}
 	}
-	url := content.URL
-	var file *event.EncryptedFileInfo
-	if content.File != nil {
-		url = content.File.URL
-		file = content.File
-	}
-	if url == "" {
-		ce.Reply("Replied-to message has no file attachment")
-		return nil, false
-	}
-	data, err := ce.Bot.DownloadMedia(ce.Ctx, url, file)
-	if err != nil {
-		ce.Reply("Failed to download file: %v", err)
-		return nil, false
-	}
-	return data, true
+
+	return convos, errors
 }
+
+// --- export command ---
 
 var cmdExport = &commands.FullHandler{
 	Func: fnExport,
 	Name: "export",
 	Help: commands.HelpMeta{
 		Section:     commands.HelpSectionChats,
-		Description: "Manage Messenger JSON exports: load (reply to zip), list, send",
+		Description: "Import Messenger exports: load <path>, list, send, undo",
 	},
 	RequiresLogin: true,
 }
 
 func fnExport(ce *commands.Event) {
 	if len(ce.Args) == 0 {
-		ce.Reply("Usage: `export load` (reply to zip), `export list`, `export send` (in DM room)")
+		ce.Reply("Usage: `export load <path>`, `export list`, `export send [name]` (in DM room), `export undo`")
 		return
 	}
 	switch ce.Args[0] {
@@ -215,83 +224,27 @@ func fnExport(ce *commands.Event) {
 }
 
 func fnExportLoad(ce *commands.Event) {
-	zipData, ok := downloadAttachment(ce)
-	if !ok {
+	if len(ce.Args) < 2 {
+		ce.Reply("Usage: `export load /path/to/msgs`")
+		return
+	}
+	dir := ce.Args[1]
+
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		ce.Reply("Not a valid directory: %s", dir)
 		return
 	}
 
-	reader, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
-	if err != nil {
-		ce.Reply("Failed to read zip: %v", err)
-		return
-	}
-
-	convos := make(map[string]*loadedConversation)
-	mediaFiles := make(map[string][]byte)
-	var errors []string
-
-	// First pass: read all files from the zip
-	zipFiles := make(map[string][]byte)
-	for _, f := range reader.File {
-		if f.FileInfo().IsDir() {
-			continue
-		}
-		rc, err := f.Open()
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("%s: open error: %v", f.Name, err))
-			continue
-		}
-		var buf bytes.Buffer
-		_, err = buf.ReadFrom(rc)
-		rc.Close()
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("%s: read error: %v", f.Name, err))
-			continue
-		}
-		zipFiles[f.Name] = buf.Bytes()
-	}
-
-	// Store media files (anything not .json)
-	for name, data := range zipFiles {
-		if filepath.Ext(name) != ".json" {
-			mediaFiles[name] = data
-		}
-	}
-
-	// Parse JSON files
-	for name, data := range zipFiles {
-		if filepath.Ext(name) != ".json" {
-			continue
-		}
-
-		export, err := parseMessengerExport(data)
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("%s: parse error: %v", name, err))
-			continue
-		}
-
-		other := otherParticipant(export.Participants)
-		if other == "" {
-			errors = append(errors, fmt.Sprintf("%s: can't determine other participant from %v", name, export.Participants))
-			continue
-		}
-
-		toSend := filterAndSortMessages(export.Messages)
-		key := strings.ToLower(other)
-		convos[key] = &loadedConversation{
-			OtherParticipant: other,
-			AllMessages:      export.Messages,
-			ToSend:           toSend,
-		}
-	}
+	convos, errors := loadFromDir(dir)
 
 	loadedConversationsMu.Lock()
 	loadedConversations = convos
-	loadedMediaFiles = mediaFiles
+	loadedMsgsDir = dir
 	loadedConversationsMu.Unlock()
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Loaded %d conversations, %d media files:\n\n", len(convos), len(mediaFiles))
+	fmt.Fprintf(&sb, "Loaded %d conversations from `%s`:\n\n", len(convos), dir)
 	for _, c := range convos {
 		fmt.Fprintf(&sb, "- **%s**: %d importable, %d skipped\n",
 			c.OtherParticipant, len(c.ToSend), len(c.AllMessages)-len(c.ToSend))
@@ -311,7 +264,7 @@ func fnExportList(ce *commands.Event) {
 	loadedConversationsMu.Unlock()
 
 	if len(convos) == 0 {
-		ce.Reply("No conversations loaded. Use `export load` first (reply to a zip file).")
+		ce.Reply("No conversations loaded. Use `export load /path/to/msgs` first.")
 		return
 	}
 
@@ -341,6 +294,7 @@ func fnExportSend(ce *commands.Event) {
 
 	loadedConversationsMu.Lock()
 	convos := loadedConversations
+	msgsDir := loadedMsgsDir
 	loadedConversationsMu.Unlock()
 
 	if len(convos) == 0 {
@@ -348,23 +302,28 @@ func fnExportSend(ce *commands.Event) {
 		return
 	}
 
-	// Get the ghost for the other user in this DM
 	ghost, err := ce.Bridge.GetGhostByID(ce.Ctx, ce.Portal.OtherUserID)
 	if err != nil {
 		ce.Reply("Failed to get ghost: %v", err)
 		return
 	}
 
-	// Match loaded conversation by ghost name
-	key := strings.ToLower(ghost.Name)
+	// Accept optional contact name: "export send Anna Stosik"
+	// Falls back to ghost display name if not provided.
+	var key string
+	if len(ce.Args) > 1 {
+		key = strings.ToLower(strings.Join(ce.Args[1:], " "))
+	} else {
+		key = strings.ToLower(ghost.Name)
+	}
+
 	convo, ok := convos[key]
 	if !ok {
-		ce.Reply("No loaded conversation for %q. Available: ", ghost.Name)
 		var names []string
 		for _, c := range convos {
 			names = append(names, c.OtherParticipant)
 		}
-		ce.Reply("No loaded conversation for %q. Available: %s", ghost.Name, strings.Join(names, ", "))
+		ce.Reply("No loaded conversation for %q. Available: %s", key, strings.Join(names, ", "))
 		return
 	}
 
@@ -373,23 +332,17 @@ func fnExportSend(ce *commands.Event) {
 		return
 	}
 
-	// Get double puppet intent for sending as the user
 	userIntent := ce.User.DoublePuppet(ce.Ctx)
 	if userIntent == nil {
 		ce.Reply("Double puppet not available, can't send messages as you")
 		return
 	}
 
-	loadedConversationsMu.Lock()
-	mediaFiles := loadedMediaFiles
-	loadedConversationsMu.Unlock()
-
-	ghostName := ghost.Name
 	var eventIDs []id.EventID
 
 	for _, msg := range convo.ToSend {
 		var intent bridgev2.MatrixAPI
-		if msg.SenderName == ghostName {
+		if msg.SenderName == convo.OtherParticipant {
 			intent = ghost.Intent
 		} else {
 			intent = userIntent
@@ -399,14 +352,16 @@ func fnExportSend(ce *commands.Event) {
 
 		if msg.Type == "media" && len(msg.Media) > 0 {
 			for _, m := range msg.Media {
-				mediaPath := strings.TrimPrefix(m.URI, "./")
-				data, ok := mediaFiles[mediaPath]
-				if !ok {
-					ce.Log.Warn().Str("path", mediaPath).Msg("Media file not found in zip")
+				// Media URIs are like "./media/uuid.jpeg", resolve relative to msgsDir
+				mediaPath := filepath.Join(msgsDir, filepath.Clean(strings.TrimPrefix(m.URI, "./")))
+				data, err := os.ReadFile(mediaPath)
+				if err != nil {
+					ce.Log.Warn().Str("path", mediaPath).Err(err).Msg("Media file not found")
 					continue
 				}
 
-				ext := strings.ToLower(filepath.Ext(mediaPath))
+				fileName := filepath.Base(mediaPath)
+				ext := strings.ToLower(filepath.Ext(fileName))
 				var mimeType string
 				var msgType event.MessageType
 				switch ext {
@@ -430,11 +385,10 @@ func fnExportSend(ce *commands.Event) {
 					msgType = event.MsgFile
 				}
 
-				fileName := filepath.Base(mediaPath)
 				mxcURL, encFile, err := intent.UploadMedia(ce.Ctx, ce.Portal.MXID, data, fileName, mimeType)
 				if err != nil {
-					ce.Log.Err(err).Str("path", mediaPath).Msg("Failed to upload media")
-					ce.Reply("Error uploading %s: %v. Use `export undo` to redact %d sent so far.", mediaPath, err, len(eventIDs))
+					ce.Log.Err(err).Str("file", fileName).Msg("Failed to upload media")
+					ce.Reply("Error uploading %s: %v. Use `export undo` to redact %d sent so far.", fileName, err, len(eventIDs))
 					goto done
 				}
 
